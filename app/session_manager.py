@@ -1,5 +1,7 @@
 from __future__ import annotations
 import json
+import os
+import tempfile
 from dataclasses import asdict
 from .models import AppSettings, NameConflictPolicy, SessionState
 from .utils import app_data_dir
@@ -16,6 +18,11 @@ class SessionManager:
         return SessionState(**data)
     def save(self, state: SessionState) -> None:
         data = asdict(state); data['settings']['conflict_policy'] = state.settings.conflict_policy.value
-        self.path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=self.path.parent, delete=False) as tmp:
+            tmp.write(payload)
+            tmp_path = tmp.name
+        os.replace(tmp_path, self.path)
     def clear(self) -> None:
         if self.path.exists(): self.path.unlink()
