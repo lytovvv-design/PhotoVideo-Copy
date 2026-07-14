@@ -1,7 +1,8 @@
 from __future__ import annotations
+import logging
 from pathlib import Path
 from PIL import Image, ImageOps
-from PySide6.QtCore import Qt, QUrl, QPoint
+from PySide6.QtCore import QObject, Qt, QThread, QUrl, QPoint, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap, QWheelEvent, QMouseEvent
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -10,7 +11,36 @@ from .models import MediaFile, MediaType, FileStatus
 try:
     from pillow_heif import register_heif_opener
     register_heif_opener()
-except Exception: pass
+except Exception:
+    logging.getLogger(__name__).exception('Не удалось зарегистрировать HEIF opener')
+
+logger = logging.getLogger(__name__)
+
+
+class ImageLoadWorker(QObject):
+    loaded = Signal(QImage, int)
+    failed = Signal(str, int)
+
+    @Slot(str, int, int)
+    def load(self, path: str, rotation: int, generation: int) -> None:
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                return
+            with Image.open(path) as im:
+                im = ImageOps.exif_transpose(im)
+                im.thumbnail((2400, 1600))
+                if rotation:
+                    im = im.rotate(-rotation, expand=True)
+                if QThread.currentThread().isInterruptionRequested():
+                    return
+                im = im.convert('RGBA')
+                data = im.tobytes('raw', 'RGBA')
+                q = QImage(data, im.width, im.height, QImage.Format.Format_RGBA8888).copy()
+                self.loaded.emit(q, generation)
+        except Exception as e:
+            logger.exception('Не удалось открыть изображение %s', path)
+            self.failed.emit(str(e), generation)
+
 
 class ImageLabel(QLabel):
     def __init__(self) -> None:
@@ -33,7 +63,7 @@ class ImageLabel(QLabel):
 
 class MediaViewer(QWidget):
     def __init__(self) -> None:
-        super().__init__(); self.rotation=0; self.current: MediaFile|None=None
+        super().__init__(); self.rotation=0; self.current: MediaFile|None=None; self._image_generation=0; self._image_thread: QThread|None=None; self._image_worker: ImageLoadWorker|None=None
         self.stack=QStackedWidget(); self.image=ImageLabel(); self.video=QVideoWidget(); self.stack.addWidget(self.image); self.stack.addWidget(self.video)
         self.player=QMediaPlayer(self); self.audio=QAudioOutput(self); self.player.setAudioOutput(self.audio); self.player.setVideoOutput(self.video); self.audio.setVolume(0.5)
         self.play=QPushButton('▶/⏸'); self.pos=QSlider(Qt.Orientation.Horizontal); self.vol=QSlider(Qt.Orientation.Horizontal); self.vol.setRange(0,100); self.vol.setValue(50); self.time=QLabel('00:00 / 00:00')
@@ -41,21 +71,35 @@ class MediaViewer(QWidget):
         lay=QVBoxLayout(self); lay.addWidget(self.stack,1); lay.addLayout(controls)
         self.play.clicked.connect(self.toggle_video); self.pos.sliderMoved.connect(self.player.setPosition); self.vol.valueChanged.connect(lambda v: self.audio.setVolume(v/100)); self.player.positionChanged.connect(self._pos); self.player.durationChanged.connect(lambda d: self.pos.setRange(0,d))
     def show_media(self, media: MediaFile) -> None:
-        self.current=media; self.rotation=0; self.player.stop()
+        self.current=media; self.rotation=0; self._cancel_image_load(); self.player.stop()
         if media.media_type==MediaType.VIDEO:
             self.stack.setCurrentWidget(self.video); self.player.setSource(QUrl.fromLocalFile(str(media.path))); self.player.play()
         else:
-            self.stack.setCurrentWidget(self.image); self._load_image(media.path)
+            self.stack.setCurrentWidget(self.image); self.player.setSource(QUrl()); self._load_image(media.path)
         self.apply_status(media.status)
+    def _cancel_image_load(self) -> None:
+        self._image_generation += 1
+        if self._image_thread and self._image_thread.isRunning():
+            self._image_thread.requestInterruption()
+            self._image_thread.quit()
     def _load_image(self, path: Path) -> None:
-        try:
-            with Image.open(path) as im:
-                im=ImageOps.exif_transpose(im); im.thumbnail((2400,1600));
-                if self.rotation: im=im.rotate(-self.rotation, expand=True)
-                im=im.convert('RGBA'); data=im.tobytes('raw','RGBA'); q=QImage(data, im.width, im.height, QImage.Format.Format_RGBA8888).copy(); self.image.set_pixmap(QPixmap.fromImage(q))
-        except Exception as e: self.image.setText(f'Не удалось открыть изображение:\n{e}')
+        self.image.setText('Загрузка изображения…')
+        generation = self._image_generation
+        thread = QThread(self); worker = ImageLoadWorker(); worker.moveToThread(thread)
+        thread.started.connect(lambda: worker.load(str(path), self.rotation, generation))
+        worker.loaded.connect(self._image_loaded); worker.failed.connect(self._image_failed)
+        worker.loaded.connect(thread.quit); worker.failed.connect(thread.quit)
+        worker.loaded.connect(worker.deleteLater); worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._image_thread = thread; self._image_worker = worker; thread.start()
+    def _image_loaded(self, image: QImage, generation: int) -> None:
+        if generation != self._image_generation: return
+        self.image.set_pixmap(QPixmap.fromImage(image))
+    def _image_failed(self, error: str, generation: int) -> None:
+        if generation != self._image_generation: return
+        self.image.setText(f'Не удалось открыть изображение:\n{error}')
     def rotate(self) -> None:
-        if self.current and self.current.media_type==MediaType.IMAGE: self.rotation=(self.rotation+90)%360; self._load_image(self.current.path)
+        if self.current and self.current.media_type==MediaType.IMAGE: self.rotation=(self.rotation+90)%360; self._cancel_image_load(); self._load_image(self.current.path)
     def toggle_video(self) -> None:
         if self.player.playbackState()==QMediaPlayer.PlaybackState.PlayingState: self.player.pause()
         else: self.player.play()
