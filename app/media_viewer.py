@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 class ImageLoadWorker(QObject):
     loaded = Signal(QImage, int)
     failed = Signal(str, int)
+    finished = Signal(int)
 
     @Slot(str, int, int)
     def load(self, path: str, rotation: int, generation: int) -> None:
@@ -36,10 +37,13 @@ class ImageLoadWorker(QObject):
                 im = im.convert('RGBA')
                 data = im.tobytes('raw', 'RGBA')
                 q = QImage(data, im.width, im.height, QImage.Format.Format_RGBA8888).copy()
-                self.loaded.emit(q, generation)
+                if not QThread.currentThread().isInterruptionRequested():
+                    self.loaded.emit(q, generation)
         except Exception as e:
             logger.exception('Не удалось открыть изображение %s', path)
             self.failed.emit(str(e), generation)
+        finally:
+            self.finished.emit(generation)
 
 
 class ImageLabel(QLabel):
@@ -79,19 +83,33 @@ class MediaViewer(QWidget):
         self.apply_status(media.status)
     def _cancel_image_load(self) -> None:
         self._image_generation += 1
-        if self._image_thread and self._image_thread.isRunning():
-            self._image_thread.requestInterruption()
-            self._image_thread.quit()
+        thread = self._image_thread
+        if thread is None:
+            return
+        try:
+            if thread.isRunning():
+                thread.requestInterruption()
+                thread.quit()
+        except RuntimeError:
+            if self._image_thread is thread:
+                self._image_thread = None
+                self._image_worker = None
     def _load_image(self, path: Path) -> None:
         self.image.setText('Загрузка изображения…')
         generation = self._image_generation
         thread = QThread(self); worker = ImageLoadWorker(); worker.moveToThread(thread)
         thread.started.connect(lambda: worker.load(str(path), self.rotation, generation))
         worker.loaded.connect(self._image_loaded); worker.failed.connect(self._image_failed)
-        worker.loaded.connect(thread.quit); worker.failed.connect(thread.quit)
-        worker.loaded.connect(worker.deleteLater); worker.failed.connect(worker.deleteLater)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(lambda thread=thread, worker=worker: self._on_image_thread_finished(thread, worker))
         thread.finished.connect(thread.deleteLater)
         self._image_thread = thread; self._image_worker = worker; thread.start()
+    def _on_image_thread_finished(self, thread: QThread, worker: ImageLoadWorker) -> None:
+        if self._image_thread is thread:
+            self._image_thread = None
+        if self._image_worker is worker:
+            self._image_worker = None
     def _image_loaded(self, image: QImage, generation: int) -> None:
         if generation != self._image_generation: return
         self.image.set_pixmap(QPixmap.fromImage(image))
